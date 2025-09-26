@@ -13,6 +13,39 @@ st.set_page_config(
     layout="wide"
 )
 
+def remover_outliers(df, df_aeroportos):
+    aeroportos_validos = set(df_aeroportos['ident'].unique())
+
+    df = df[
+        df['ICAO Aeródromo Origem'].isin(aeroportos_validos) &
+        df['ICAO Aeródromo Destino'].isin(aeroportos_validos)
+    ]
+
+    df['Número Voo'] = pd.to_numeric(df['Número Voo'], errors='coerce')
+    df = df[
+        (df['Número Voo'] > 0) &
+        (df['Número Voo'] < 100000)  
+    ]
+
+    df['Partida Prevista'] = pd.to_datetime(df['Partida Prevista'], errors='coerce')
+    df['Partida Real'] = pd.to_datetime(df['Partida Real'], errors='coerce')
+    df['Chegada Prevista'] = pd.to_datetime(df['Chegada Prevista'], errors='coerce')
+    df['Chegada Real'] = pd.to_datetime(df['Chegada Real'], errors='coerce')
+
+    df = df.dropna(subset=['Partida Prevista', 'Partida Real', 'Chegada Prevista', 'Chegada Real'])
+
+    df['duracao_prevista'] = (df['Chegada Prevista'] - df['Partida Prevista']).dt.total_seconds() / 3600
+    df['duracao_real'] = (df['Chegada Real'] - df['Partida Real']).dt.total_seconds() / 3600
+
+    df = df[
+        (df['duracao_real'] > 0) &            
+        (df['duracao_real'] < 48) &           
+        (df['duracao_prevista'] > 0) &        
+        (df['duracao_prevista'] < 48)         
+    ]
+
+    return df
+
 # --- FUNÇÃO DE CARREGAMENTO DE DADOS (COM CACHE) ---
 # O decorator @st.cache_data garante que os dados sejam carregados apenas uma vez.
 @st.cache_data
@@ -20,8 +53,7 @@ def carregar_dados():
     arquivos = {
         2022: 'dataset/merge_2022.csv',
         2023: 'dataset/merge_2023.csv',
-        2024: 'dataset/merge_2024.csv',
-        2025: 'dataset/merge_2025.csv'
+        2024: 'dataset/merge_2024.csv'
     }
     lista_de_dfs = []
     for ano, caminho in arquivos.items():
@@ -60,20 +92,34 @@ def carregar_dados():
 
     df_realizados = df_completo[df_completo['Situação Voo'] == 'REALIZADO'].copy()
     
-    # --- MERGE PARA ADICIONAR NOMES DOS AEROPORTOS ---
     if not df_nomes_aeroportos.empty:
-        df_realizados = pd.merge(df_realizados, df_nomes_aeroportos, left_on='ICAO Aeródromo Origem', right_on='ident', how='left')
+        df_realizados = pd.merge(
+            df_realizados,
+            df_nomes_aeroportos,
+            left_on='ICAO Aeródromo Origem',
+            right_on='ident',
+            how='left'
+        )
         df_realizados.rename(columns={'name': 'nome_aeroporto_origem'}, inplace=True)
         df_realizados['nome_aeroporto_origem'].fillna(df_realizados['ICAO Aeródromo Origem'], inplace=True)
+        
+        aeroportos_br = df_nomes_aeroportos['ident'].unique()
+        df_realizados['envolve_brasil'] = (
+            df_realizados['ICAO Aeródromo Origem'].isin(aeroportos_br) |
+            df_realizados['ICAO Aeródromo Destino'].isin(aeroportos_br)
+        )
+        df_realizados = df_realizados[df_realizados['envolve_brasil']]
+        df_realizados.drop(columns=['envolve_brasil'], inplace=True)
     else:
         df_realizados['nome_aeroporto_origem'] = df_realizados['ICAO Aeródromo Origem']
 
-    # --- MERGE PARA ADICIONAR NOMES DAS COMPANHIAS AÉREAS ---
     if not df_airlines.empty:
         df_realizados = pd.merge(df_realizados, df_airlines[['Sigla', 'Nome']], left_on='ICAO Empresa Aérea', right_on='Sigla', how='left')
         df_realizados['Nome'].fillna(df_realizados['ICAO Empresa Aérea'], inplace=True)
     else:
         df_realizados['Nome'] = df_realizados['ICAO Empresa Aérea']
+
+    df_realizados = remover_outliers(df_realizados, df_nomes_aeroportos)
 
     colunas_de_data = ['Partida Prevista', 'Partida Real', 'Chegada Prevista', 'Chegada Real']
     for coluna in colunas_de_data:
@@ -138,27 +184,35 @@ else:
 st.subheader("✈️ Comparativo Anual de Atrasos (Top 10 Companhias)")
 if len(anos_selecionados) > 1:
     top_10_nomes = df_filtrado.groupby('Nome')['voo_atrasado'].sum().nlargest(10).index
-    
     df_para_plot = df_filtrado[df_filtrado['Nome'].isin(top_10_nomes)]
-    atrasos_companhia_ano = df_para_plot.groupby(['ano', 'Nome'])['voo_atrasado'].sum().reset_index()
+
+    # Total de voos realizados por companhia e ano
+    total_voos = df_para_plot.groupby(['ano', 'Nome'])['voo_atrasado'].count().reset_index(name='total_voos')
+    # Total de voos atrasados por companhia e ano
+    total_atrasos = df_para_plot.groupby(['ano', 'Nome'])['voo_atrasado'].sum().reset_index(name='total_atrasos')
     
-    if not atrasos_companhia_ano.empty:
-        fig_companhia, ax_companhia = plt.subplots(figsize=(12, 7)) 
-        sns.barplot(data=atrasos_companhia_ano, x='Nome', y='voo_atrasado', hue='ano', ax=ax_companhia, palette='viridis')
-        
-        ax_companhia.set_title('Comparativo de Atrasos na Partida por Ano (Top 10 Companhias)')
-        ax_companhia.set_xlabel('Companhia Aérea')
-        ax_companhia.set_ylabel('Número Total de Voos Atrasados')
-        ax_companhia.grid(axis='y', linestyle='--', linewidth=0.7)
-        
-        plt.xticks(rotation=45, ha='right')
-        
-        plt.tight_layout()
-        st.pyplot(fig_companhia)
-    else:
-        st.info("Não há dados de atrasos de companhias para os anos selecionados.")
-else:
-    st.info("Selecione mais de um ano no filtro para visualizar a comparação entre companhias aéreas.")
+    # Merge para calcular percentual
+    df_percentual = pd.merge(total_voos, total_atrasos, on=['ano', 'Nome'])
+    df_percentual['percentual_atrasos'] = (df_percentual['total_atrasos'] / df_percentual['total_voos']) * 100
+
+    # Plot
+    fig_companhia, ax_companhia = plt.subplots(figsize=(12, 7))
+    sns.barplot(
+        data=df_percentual,
+        x='Nome',
+        y='percentual_atrasos',
+        hue='ano',
+        ax=ax_companhia,
+        palette='viridis'
+    )
+
+    ax_companhia.set_title('Comparativo de Atrasos (%) por Ano (Top 10 Companhias)')
+    ax_companhia.set_xlabel('Companhia Aérea')
+    ax_companhia.set_ylabel('Percentual de Voos Atrasados (%)')
+    ax_companhia.grid(axis='y', linestyle='--', linewidth=0.7)
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    st.pyplot(fig_companhia)
 
 st.subheader("📅 Atrasos por Dia da Semana e Período do Dia")
 col_dia, col_periodo = st.columns(2)
